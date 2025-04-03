@@ -7,7 +7,7 @@ from pathlib import Path
 
 from crawl4ai import AsyncWebCrawler, CrawlResult
 from crawl4ai import BFSDeepCrawlStrategy, DFSDeepCrawlStrategy, URLPatternFilter, FilterChain
-from crawl4ai import JsonCssExtractionStrategy
+from crawl4ai import JsonCssExtractionStrategy, LLMExtractionStrategy, LLMConfig
 
 class SimpleCrawler:
     """
@@ -262,7 +262,8 @@ class CustomCrawler:
         query: Optional[str] = None,
         selectors: Optional[Dict[str, str]] = None,
         extraction_strategy: str = "heuristic",
-        output_format: str = "markdown"
+        output_format: str = "markdown",
+        llm_extraction_strategy: Optional[LLMExtractionStrategy] = None
     ) -> Dict[str, Any]:
         """
         Perform a custom crawl with specialized extraction.
@@ -271,29 +272,74 @@ class CustomCrawler:
             url: The URL to crawl
             query: A natural language query to guide extraction
             selectors: CSS selectors for structured extraction
-            extraction_strategy: Strategy for extraction ('heuristic' or 'llm')
+            extraction_strategy: Strategy for extraction ('heuristic', 'llm', or 'selectors')
             output_format: The output format (markdown, html, text, json)
+            llm_extraction_strategy: Optional LLMExtractionStrategy instance for advanced LLM extraction
             
         Returns:
             A dictionary containing the custom crawl results
         """
         async with AsyncWebCrawler() as crawler:
             # Configure extraction based on strategy
-            if extraction_strategy == "llm" and query:
-                # Use LLM-guided extraction if query is provided
-                result = await crawler.arun(
-                    url=url,
-                    question=query
-                )
-                
-                return {
-                    "url": url,
-                    "extraction_strategy": "llm",
-                    "query": query,
-                    "title": result.title,
-                    "content": result.markdown if output_format == "markdown" else result.text,
-                    "links": result.links
-                }
+            if extraction_strategy == "llm":
+                if llm_extraction_strategy:
+                    # Use the provided LLM extraction strategy
+                    result = await crawler.arun(
+                        url=url,
+                        extraction_strategy=llm_extraction_strategy
+                    )
+                    
+                    # Create a safe response with error handling
+                    response = {
+                        "url": url,
+                        "extraction_strategy": "llm",
+                        "extracted_data": getattr(result, 'json', {})
+                    }
+                    
+                    # Add optional fields if they exist
+                    if hasattr(result, 'title'):
+                        response["title"] = result.title
+                    if hasattr(result, 'links'):
+                        response["links"] = result.links
+                        
+                    return response
+                elif query:
+                    # Use LLM-guided extraction with query if no strategy provided
+                    result = await crawler.arun(
+                        url=url,
+                        question=query
+                    )
+                    
+                    # Create a safe response with error handling
+                    response = {
+                        "url": url,
+                        "extraction_strategy": "llm",
+                        "query": query
+                    }
+                    
+                    # Add optional fields if they exist
+                    if hasattr(result, 'title'):
+                        response["title"] = result.title
+                    if hasattr(result, 'links'):
+                        response["links"] = result.links
+                    
+                    # Add content based on the requested output format
+                    if output_format == "markdown" and hasattr(result, 'markdown'):
+                        response["content"] = result.markdown
+                    elif output_format == "text" and hasattr(result, 'text'):
+                        response["content"] = result.text
+                    elif output_format == "html" and hasattr(result, 'html'):
+                        response["content"] = result.html
+                    elif output_format == "json" and hasattr(result, 'json'):
+                        response["content"] = result.json
+                    else:
+                        # Fallback to any available content
+                        for attr in ['text', 'markdown', 'html', 'json']:
+                            if hasattr(result, attr):
+                                response["content"] = getattr(result, attr)
+                                break
+                        
+                    return response
             
             elif selectors:
                 # Use CSS selectors for structured extraction
@@ -313,6 +359,30 @@ class CustomCrawler:
                     "links": result.links
                 }
             
+            elif extraction_strategy == "html":
+                # Use HTML extraction for direct parsing
+                result = await crawler.arun(
+                    url=url
+                )
+                
+                # Create a safe response with error handling
+                response = {
+                    "url": url,
+                    "extraction_strategy": "html",
+                    "extracted_data": {
+                        "url": url,
+                        "html": result.html if hasattr(result, 'html') else ""
+                    }
+                }
+                
+                # Add optional fields if they exist
+                if hasattr(result, 'title'):
+                    response["title"] = result.title
+                if hasattr(result, 'links'):
+                    response["links"] = result.links
+                
+                return response
+            
             else:
                 # Fall back to heuristic extraction
                 result = await crawler.arun(
@@ -321,18 +391,28 @@ class CustomCrawler:
                 
                 response = {
                     "url": url,
-                    "extraction_strategy": "heuristic",
-                    "title": result.title,
-                    "links": result.links,
+                    "extraction_strategy": "heuristic"
                 }
                 
-                if output_format == "markdown":
+                # Add optional fields if they exist
+                if hasattr(result, 'title'):
+                    response["title"] = result.title
+                if hasattr(result, 'links'):
+                    response["links"] = result.links
+                
+                if output_format == "markdown" and hasattr(result, 'markdown'):
                     response["content"] = result.markdown
-                elif output_format == "html":
+                elif output_format == "html" and hasattr(result, 'html'):
                     response["content"] = result.html
-                elif output_format == "text":
+                elif output_format == "text" and hasattr(result, 'text'):
                     response["content"] = result.text
-                elif output_format == "json":
+                elif output_format == "json" and hasattr(result, 'json'):
                     response["content"] = result.json
+                else:
+                    # Fallback to any available content
+                    for attr in ['text', 'markdown', 'html', 'json']:
+                        if hasattr(result, attr):
+                            response["content"] = getattr(result, attr)
+                            break
                 
                 return response

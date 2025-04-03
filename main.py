@@ -1,14 +1,21 @@
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, HttpUrl
-from typing import Optional, Dict, List, Union, Any, Set
+from pydantic import BaseModel, HttpUrl, Field, validator
+from typing import Optional, Dict, List, Union, Any, Set, Literal
 import asyncio
 import uuid
 import os
+import json
+import re
 from datetime import datetime
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
 
 from crawlers import SimpleCrawler, DeepCrawler, CustomCrawler
 from bs4 import BeautifulSoup
+from crawl4ai import LLMExtractionStrategy, LLMConfig
 
 app = FastAPI(title="Web Crawler Backend", description="Backend API for crawling websites using crawl4ai")
 
@@ -78,11 +85,63 @@ class CrawlResult(BaseModel):
 
 class InvestmentOption(BaseModel):
     protocol_name: str
-    tvl: float  # Total Value Locked
+    tvl: Union[float, str] = 0.0  # Total Value Locked
     chain: str
     category: Optional[str] = None
     url: Optional[str] = None
     description: Optional[str] = None
+    
+    @validator('tvl', pre=True)
+    def parse_tvl(cls, v):
+        if isinstance(v, str):
+            if v == "Unknown":
+                return 0.0
+            # Remove any non-numeric characters except decimal point
+            v = re.sub(r'[^0-9.]', '', v)
+            try:
+                return float(v)
+            except (ValueError, TypeError):
+                return 0.0
+        return v or 0.0
+
+
+class Protocol(BaseModel):
+    """Model for protocol information extracted by LLM"""
+    name: str = Field(description="The name of the protocol")
+    tvl: Optional[Union[float, str]] = Field(description="Total Value Locked in USD")
+    category: Optional[str] = Field(None, description="Category of the protocol (e.g., Lending, DEX, etc.)")
+    chain: Optional[str] = Field(None, description="Blockchain the protocol operates on")
+    description: Optional[str] = Field(None, description="Brief description of what the protocol does")
+    apy: Optional[Union[float, str]] = Field(None, description="Annual Percentage Yield if available")
+    risks: Optional[List[str]] = Field(None, description="Potential risks associated with the protocol")
+    url: Optional[str] = Field(None, description="URL to the protocol's page")
+    
+    @validator('tvl', pre=True)
+    def parse_tvl(cls, v):
+        if isinstance(v, str):
+            # Remove any non-numeric characters except decimal point
+            v = re.sub(r'[^0-9.]', '', v)
+            try:
+                return float(v)
+            except (ValueError, TypeError):
+                return 0.0
+        return v or 0.0
+    
+    @validator('apy', pre=True)
+    def parse_apy(cls, v):
+        if isinstance(v, str):
+            # Remove any non-numeric characters except decimal point
+            v = re.sub(r'[^0-9.]', '', v)
+            try:
+                return float(v)
+            except (ValueError, TypeError):
+                return None
+        return v
+
+
+class ProtocolList(BaseModel):
+    """Model for a list of protocols extracted by LLM"""
+    protocols: List[Protocol] = Field(description="List of protocols found on the page")
 
 class PortfolioAnalysisResult(BaseModel):
     job_id: str
@@ -415,15 +474,55 @@ async def run_portfolio_analysis(job_id, blockchain_id, assets, include_top_prot
         try:
             crawler = DeepCrawler()
             
-            # Perform deep crawl on DeFiLlama with a timeout
-            result = await crawler.deep_crawl(
-                url="https://defillama.com/top-protocols",
-                strategy="bfs",  # Breadth-first search to get related protocol pages
-                max_pages=include_top_protocols * 2,  # Crawl more pages to get detailed protocol info
-                max_depth=2,  # Limit depth to avoid excessive crawling
-                output_format="json",
-                timeout=30000  # 30 seconds timeout
-            )
+            # Use CustomCrawler with LLM extraction strategy for better analysis
+            custom_crawler = CustomCrawler()
+            
+            # Check if OpenAI API key is available
+            openai_api_key = os.environ.get("OPENAI_API_KEY", "")
+            if not openai_api_key:
+                log("WARNING: No OpenAI API key found in environment variables. Skipping LLM extraction and using direct HTML parsing.")
+                extraction_strategy = "html"
+            else:
+                log("OpenAI API key found. Using LLM extraction strategy.")
+                extraction_strategy = "llm"
+                
+            # Create an LLM extraction strategy if we have an API key
+            if extraction_strategy == "llm":
+                llm_extraction_strategy = LLMExtractionStrategy(
+                    llm_config=LLMConfig(
+                        provider="openai/gpt-3.5-turbo",  # You can change to your preferred model
+                        api_token=openai_api_key  # Get API key from environment
+                    ),
+                    schema=ProtocolList.model_json_schema(),  # Use our Pydantic model schema
+                    extraction_type="schema",
+                    instruction=f"Extract a list of top DeFi protocols from this page. Focus on protocols available on {blockchain_id}. Include name, TVL (Total Value Locked), category, and other available information. Return the data as a structured JSON object with a 'protocols' array containing protocol objects.",
+                    chunk_token_threshold=4000,
+                    overlap_rate=0.1,
+                    apply_chunking=True,
+                    input_format="html",
+                    extra_args={"temperature": 0.1}
+                )
+            
+            # Perform the crawl with the appropriate extraction strategy
+            if extraction_strategy == "llm":
+                # Log the schema being used for extraction
+                log(f"Using schema for extraction: {ProtocolList.model_json_schema()}")
+                
+                # Perform the crawl with LLM extraction
+                result = await custom_crawler.custom_crawl(
+                    url="https://defillama.com/top-protocols",
+                    extraction_strategy="llm",  # Use LLM-based extraction
+                    output_format="json",
+                    llm_extraction_strategy=llm_extraction_strategy
+                )
+            else:
+                # Perform the crawl with HTML extraction
+                log("Using direct HTML extraction")
+                result = await custom_crawler.custom_crawl(
+                    url="https://defillama.com/top-protocols",
+                    extraction_strategy="html",  # Use HTML-based extraction
+                    output_format="json"
+                )
         except Exception as browser_error:
             log(f"Browser automation failed: {str(browser_error)}")
             log("Returning empty investment options array")
@@ -449,84 +548,203 @@ async def run_portfolio_analysis(job_id, blockchain_id, assets, include_top_prot
             
             return
         
-        # Filter results manually to include only protocol detail pages
-        filtered_results = []
-        for page_result in result["results"]:
-            url = page_result["url"]
-            # Include the main page
-            if url == "https://defillama.com/top-protocols":
-                filtered_results.append(page_result)
-            # Include protocol detail pages
-            elif url.startswith("https://defillama.com/protocol/") and "?" not in url and "#" not in url:
-                filtered_results.append(page_result)
-        
-        # Replace the results with our filtered list
-        result["results"] = filtered_results
-        
-        # Process the results to filter protocols relevant to the specified blockchain
-        investment_options = []
+        # Process the results from LLM extraction
+        log(f"Processing LLM extraction results for {blockchain_id}")
         protocols_found = {}
         
-        # First, extract protocols from the main page
-        main_page_result = None
-        for page_result in result["results"]:
-            if page_result["url"] == "https://defillama.com/top-protocols":
-                main_page_result = page_result
-                break
-        
-        if main_page_result:
-            # Log debugging information
-            log(f"Main page URL: {main_page_result['url']}")
-            log(f"Content type: {type(main_page_result['content'])}")
-            
-            # Extract a sample of the content to understand its structure
-            content_sample = str(main_page_result['content'])[:500] if main_page_result['content'] else "No content"
-            log(f"Content sample: {content_sample}")
-            
-            # Check if the content is in JSON format
-            import json
-            import re
-            
-            # Since we're having trouble with the HTML parsing, let's try a more direct approach
-            # Let's create some hardcoded investment options for Ethereum
-            protocols_found = {}
-            
-            # Top Ethereum protocols based on TVL
-            top_ethereum_protocols = [
-                {"name": "Lido", "tvl": 22500000000, "category": "Liquid Staking", "url": "https://defillama.com/protocol/lido"},
-                {"name": "MakerDAO", "tvl": 8100000000, "category": "CDP", "url": "https://defillama.com/protocol/makerdao"},
-                {"name": "Aave", "tvl": 6200000000, "category": "Lending", "url": "https://defillama.com/protocol/aave"},
-                {"name": "Uniswap", "tvl": 3900000000, "category": "Dexes", "url": "https://defillama.com/protocol/uniswap"},
-                {"name": "Curve", "tvl": 2800000000, "category": "Dexes", "url": "https://defillama.com/protocol/curve"},
-            ]
-            
-            # Add these protocols to our investment options
-            for protocol in top_ethereum_protocols:
-                if len(protocols_found) < include_top_protocols:
-                    protocols_found[protocol["name"]] = InvestmentOption(
-                        protocol_name=protocol["name"],
-                        tvl=protocol["tvl"],
-                        chain=blockchain_id,
-                        category=protocol["category"],
-                        url=protocol["url"],
-                        description=f"Investment opportunity in {protocol['name']} on {blockchain_id}"
-                    )
-                    log(f"Added {protocol['name']} to investment options (hardcoded)")
+        try:
+            # Check if we have extracted data in the result
+            if "extracted_data" in result and result["extracted_data"]:
+                log("Found extracted_data in result")
+                extracted_data = result["extracted_data"]
+                
+                # Log a sample of the extracted data
+                log(f"Extracted data sample: {str(extracted_data)[:500]}...")
+                
+                # Handle the case where extracted_data is a method (CrawlResult.json)
+                if hasattr(extracted_data, '__call__'):
+                    try:
+                        log("Extracted data is a method, trying to call it")
+                        extracted_data = extracted_data()
+                        log(f"Called method, got: {str(extracted_data)[:500]}...")
+                    except Exception as e:
+                        log(f"Error calling extracted_data method: {str(e)}")
+                        extracted_data = {}
+                
+                # If we have HTML in the extracted data, try to parse it directly
+                if isinstance(extracted_data, dict) and "html" in extracted_data:
+                    log("Found HTML in extracted data, trying to parse it directly")
+                    try:
+                        html_content = extracted_data["html"]
+                        soup = BeautifulSoup(html_content, "html.parser")
+                        
+                        # Log the structure of the HTML to help with debugging
+                        log("Analyzing HTML structure...")
+                        
+                        # Find all tables in the document
+                        tables = soup.find_all("table")
+                        log(f"Found {len(tables)} tables in the HTML")
+                        
+                        # Look for divs that might contain protocol data
+                        protocol_divs = soup.find_all("div", class_="table-responsive")
+                        log(f"Found {len(protocol_divs)} table-responsive divs")
+                        
+                        # Look for protocol cards or list items
+                        protocol_cards = soup.find_all("div", class_="card")
+                        log(f"Found {len(protocol_cards)} card divs")
+                        
+                        # Try to find protocol names and TVL values directly
+                        protocols_list = []
+                        
+                        # Method 1: Look for protocol name elements
+                        protocol_name_elements = soup.find_all("a", href=lambda href: href and "/protocol/" in href)
+                        log(f"Found {len(protocol_name_elements)} protocol name links")
+                        
+                        for protocol_element in protocol_name_elements[:10]:  # Limit to top 10
+                            try:
+                                # Get protocol name
+                                protocol_name = protocol_element.text.strip()
+                                
+                                # Try to find TVL near this element
+                                parent_row = protocol_element.find_parent("tr")
+                                tvl_text = "Unknown"
+                                
+                                if parent_row:
+                                    # Look for TVL in the same row
+                                    tvl_cells = parent_row.find_all("td")
+                                    if len(tvl_cells) >= 3:
+                                        tvl_text = tvl_cells[2].text.strip()
+                                
+                                # Create protocol object
+                                protocol = {
+                                    "name": protocol_name,
+                                    "tvl": tvl_text,
+                                    "chain": blockchain_id,  # Default to requested blockchain
+                                    "category": "DeFi",
+                                    "url": "https://defillama.com" + protocol_element.get("href", "")
+                                }
+                                
+                                protocols_list.append(protocol)
+                                log(f"Found protocol: {protocol_name} with TVL: {tvl_text}")
+                            except Exception as e:
+                                log(f"Error processing protocol element: {str(e)}")
+                        
+                        log(f"Extracted {len(protocols_list)} protocols from HTML")
+                        if protocols_list:
+                            extracted_data = {"protocols": protocols_list}
+                        else:
+                            log("No protocols found in HTML, trying alternative parsing methods")
+                            
+                            # Method 2: Try to find protocol information in any table
+                            for table in tables:
+                                rows = table.find_all("tr")
+                                log(f"Analyzing table with {len(rows)} rows")
+                                
+                                for row in rows[1:]:  # Skip header row
+                                    cells = row.find_all("td")
+                                    if len(cells) >= 2:
+                                        try:
+                                            protocol_name = cells[0].text.strip()
+                                            tvl_value = cells[1].text.strip()
+                                            
+                                            protocol = {
+                                                "name": protocol_name,
+                                                "tvl": tvl_value,
+                                                "chain": blockchain_id,
+                                                "category": "DeFi"
+                                            }
+                                            
+                                            protocols_list.append(protocol)
+                                            log(f"Found protocol in table: {protocol_name}")
+                                        except Exception as e:
+                                            log(f"Error processing table row: {str(e)}")
+                            
+                            if protocols_list:
+                                extracted_data = {"protocols": protocols_list}
+                                log(f"Extracted {len(protocols_list)} protocols from tables")
+                    except Exception as e:
+                        log(f"Error parsing HTML directly: {str(e)}")
+                        import traceback
+                        log(traceback.format_exc())
+                
+                # Parse the extracted data if it's a string
+                if isinstance(extracted_data, str):
+                    # Try to parse JSON string
+                    try:
+                        extracted_data = json.loads(extracted_data)
+                        log("Successfully parsed extracted_data as JSON")
+                    except json.JSONDecodeError as e:
+                        log(f"Error parsing extracted data as JSON: {str(e)}")
+                        log("Will try to continue with the raw string data")
+                
+                # Check if we have a protocols list in the extracted data
+                if isinstance(extracted_data, dict) and "protocols" in extracted_data:
+                    protocols_list = extracted_data["protocols"]
+                    log(f"Found {len(protocols_list)} protocols in extracted data")
+                elif isinstance(extracted_data, list):
+                    # If the extracted data is already a list, use it directly
+                    protocols_list = extracted_data
+                    log(f"Extracted data is a list with {len(protocols_list)} items")
+                else:
+                    log(f"Extracted data structure: {type(extracted_data)}")
+                    protocols_list = []
+                
+                # Process each protocol
+                for protocol in protocols_list:
+                    if len(protocols_found) >= include_top_protocols:
+                        break
+                        
+                    # Skip protocols that don't match the requested blockchain
+                    if "chain" in protocol and protocol["chain"].lower() != blockchain_id.lower():
+                        # Skip protocols that don't match the blockchain
+                        continue
+                        
+                    protocol_name = protocol.get("name", "")
+                    if protocol_name and protocol_name not in protocols_found:
+                        # Create an investment option from the protocol
+                        protocols_found[protocol_name] = InvestmentOption(
+                            protocol_name=protocol_name,
+                            tvl=protocol.get("tvl", 0.0),
+                            chain=blockchain_id,
+                            category=protocol.get("category", "DeFi"),
+                            url=protocol.get("url", f"https://defillama.com/protocol/{protocol_name.lower().replace(' ', '-')}"),
+                            description=protocol.get("description", f"Investment opportunity in {protocol_name} on {blockchain_id}")
+                        )
+                        log(f"Added {protocol_name} to investment options from LLM extraction")
+                if not protocols_list:
+                    log("No protocols list found in extracted data")
+            else:
+                log("No extracted_data found in result")
+                
+        except Exception as e:
+            log(f"Error processing LLM extraction results: {str(e)}")
+            import traceback
+            log(traceback.format_exc())
             
             # Now continue with the regular parsing as a backup
             try:
-                # Try to parse the content as JSON
-                content_json = json.loads(main_page_result["content"])
-                log("Content is in JSON format")
-                
-                # Check if the JSON has an 'html' field
-                if 'html' in content_json:
-                    log("JSON contains HTML field")
-                    html_content = content_json['html']
-                    soup = BeautifulSoup(html_content, "html.parser")
+                # We already have the result from the earlier crawl
+                if "content" in result:
+                    # Try to parse the content as JSON
+                    try:
+                        content_json = json.loads(result["content"])
+                        log("Content is in JSON format")
+                        
+                        # Check if the JSON has an 'html' field
+                        if 'html' in content_json:
+                            log("JSON contains HTML field")
+                            html_content = content_json['html']
+                            soup = BeautifulSoup(html_content, "html.parser")
+                    except json.JSONDecodeError:
+                        log("Content is not in JSON format")
                 else:
-                    log("JSON does not contain HTML field")
-                    log(f"JSON keys: {list(content_json.keys())}")
+                    log("No content field in result")
+                    
+                    # Try to use the HTML from extracted_data if available
+                    if isinstance(extracted_data, dict) and "html" in extracted_data:
+                        log("Using HTML from extracted_data instead")
+                        html_content = extracted_data["html"]
+                        soup = BeautifulSoup(html_content, "html.parser")
                     # Try to use the entire JSON as the content
                     soup = BeautifulSoup(str(content_json), "html.parser")
             except json.JSONDecodeError:
@@ -713,52 +931,54 @@ async def run_portfolio_analysis(job_id, blockchain_id, assets, include_top_prot
                         except Exception as e:
                             log(f"Error extracting protocol name from row {i}: {str(e)}")
         
-        # Now look for detailed protocol information from the crawled protocol pages
-        log("\nProcessing protocol detail pages:")
-        log(f"Number of protocol pages to process: {sum(1 for p in result['results'] if 'protocol' in p['url'])}")
-        
-        for page_result in result["results"]:
-            if "protocol" in page_result["url"]:
-                # Extract protocol name from URL
-                protocol_url = page_result["url"]
-                log(f"Processing protocol page: {protocol_url}")
-                
-                protocol_path = protocol_url.split("/")[-1]
-                protocol_name = protocol_path.replace("-", " ").title()
-                log(f"Extracted protocol name: {protocol_name}")
-                
-                # If we already have this protocol in our list, enhance it with description
-                if protocol_name in protocols_found:
-                    log(f"Found existing protocol in our list: {protocol_name}")
+        # Skip the detailed protocol pages processing when using LLM extraction
+        # This part is only relevant for the legacy HTML parsing approach
+        if "results" in result:
+            log("\nProcessing protocol detail pages:")
+            log(f"Number of protocol pages to process: {sum(1 for p in result['results'] if 'protocol' in p['url'])}")
+            
+            for page_result in result["results"]:
+                if "protocol" in page_result["url"]:
+                    # Extract protocol name from URL
+                    protocol_url = page_result["url"]
+                    log(f"Processing protocol page: {protocol_url}")
                     
-                    # Extract description from the protocol page
-                    soup = BeautifulSoup(page_result["content"], "html.parser")
+                    protocol_path = protocol_url.split("/")[-1]
+                    protocol_name = protocol_path.replace("-", " ").title()
+                    log(f"Extracted protocol name: {protocol_name}")
                     
-                    # Log the structure of the protocol page to help debug
-                    log(f"Protocol page structure for {protocol_name}:")
-                    for i, tag in enumerate(soup.find_all(['div', 'h1', 'h2', 'h3', 'p'])):
-                        if i < 10:  # Limit to first 10 elements
-                            class_attr = tag.get('class')
-                            if class_attr and any('desc' in c.lower() for c in class_attr):
-                                log(f"Potential description tag: {tag.name} - Class: {class_attr} - Text: {tag.text[:50]}...")
-                    
-                    # Try different ways to find the description
-                    description_div = soup.find("div", {"class": "description"})
-                    
-                    if not description_div:
-                        # Try alternative selectors
-                        description_div = soup.find("div", class_=lambda c: c and 'desc' in c.lower())
-                    
-                    if not description_div:
-                        # Try looking for paragraphs that might contain descriptions
-                        description_div = soup.find("p", class_=lambda c: c and 'desc' in c.lower())
-                    
-                    if description_div:
-                        description_text = description_div.text.strip()
-                        protocols_found[protocol_name].description = description_text
-                        log(f"Added description to {protocol_name}: {description_text[:100]}...")
-                    else:
-                        log(f"No description found for {protocol_name}")
+                    # If we already have this protocol in our list, enhance it with description
+                    if protocol_name in protocols_found:
+                        log(f"Found existing protocol in our list: {protocol_name}")
+                        
+                        # Extract description from the protocol page
+                        soup = BeautifulSoup(page_result["content"], "html.parser")
+                        
+                        # Log the structure of the protocol page to help debug
+                        log(f"Protocol page structure for {protocol_name}:")
+                        for i, tag in enumerate(soup.find_all(['div', 'h1', 'h2', 'h3', 'p'])):
+                            if i < 10:  # Limit to first 10 elements
+                                class_attr = tag.get('class')
+                                if class_attr and any('desc' in c.lower() for c in class_attr):
+                                    log(f"Potential description tag: {tag.name} - Class: {class_attr} - Text: {tag.text[:50]}...")
+                        
+                        # Try different ways to find the description
+                        description_div = soup.find("div", {"class": "description"})
+                        
+                        if not description_div:
+                            # Try alternative selectors
+                            description_div = soup.find("div", class_=lambda c: c and 'desc' in c.lower())
+                        
+                        if not description_div:
+                            # Try looking for paragraphs that might contain descriptions
+                            description_div = soup.find("p", class_=lambda c: c and 'desc' in c.lower())
+                        
+                        if description_div:
+                            description_text = description_div.text.strip()
+                            protocols_found[protocol_name].description = description_text
+                            log(f"Added description to {protocol_name}: {description_text[:100]}...")
+                        else:
+                            log(f"No description found for {protocol_name}")
                 else:
                     log(f"Protocol {protocol_name} not in our filtered list, skipping")
         
