@@ -4,10 +4,16 @@ import os
 import json
 import re
 from pathlib import Path
+import logging
 
 from crawl4ai import AsyncWebCrawler, CrawlResult
 from crawl4ai import BFSDeepCrawlStrategy, DFSDeepCrawlStrategy, URLPatternFilter, FilterChain
 from crawl4ai import JsonCssExtractionStrategy, LLMExtractionStrategy, LLMConfig
+from llm_providers import get_llm_config, LLMProvider
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 class SimpleCrawler:
     """

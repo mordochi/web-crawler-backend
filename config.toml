@@ -1,0 +1,23 @@
+# LLM Provider Configuration
+[llm]
+# Set the default provider to use (openai, claude, ollama)
+default_provider = "ollama"
+
+# OpenAI Configuration
+# [llm.openai]
+# api_key = ""  # Set in .env or provide here
+# model = "gpt-3.5-turbo"
+# temperature = 0.1
+
+# Claude Configuration
+# [llm.claude]
+# api_key = ""  # Set in .env or provide here
+# model = "claude-3-sonnet-20240229"
+# temperature = 0.0
+# base_url = "https://api.anthropic.com/v1/"
+
+# Ollama Configuration
+[llm.ollama]
+model = "llama3.2:latest"  # Use the model you have installed in Ollama
+temperature = 0.0
+base_url = "http://localhost:11434/v1"

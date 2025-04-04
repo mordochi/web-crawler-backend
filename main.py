@@ -16,6 +16,18 @@ load_dotenv()
 from crawlers import SimpleCrawler, DeepCrawler, CustomCrawler
 from bs4 import BeautifulSoup
 from crawl4ai import LLMExtractionStrategy, LLMConfig
+from llm_providers import get_llm_config, LLMProvider
+
+# Configure logging
+import logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# Global log function
+def log(message):
+    """Global logging function that prints to console and logs to the logger"""
+    print(message)
+    logger.info(message)
 
 app = FastAPI(title="Web Crawler Backend", description="Backend API for crawling websites using crawl4ai")
 
@@ -314,17 +326,8 @@ async def run_simple_crawl(job_id, url, output_format, wait_for_seconds, capture
     except Exception as e:
         import traceback
         error_details = traceback.format_exc()
-        log(f"Portfolio analysis failed: {str(e)}\n{error_details}")
-        
-        # Add a summary of what we found so far
-        log("\nSummary of findings:")
-        log(f"Number of protocols found: {len(protocols_found)}")
-        if protocols_found:
-            log("Protocols found:")
-            for name, protocol in protocols_found.items():
-                log(f"- {name} ({protocol.category}): ${protocol.tvl:.2f}")
-        else:
-            log("No protocols found matching the criteria.")
+        log(f"Custom crawl failed: {str(e)}")
+        log(error_details)
         
         crawl_jobs[job_id].update({
             "status": "failed",
@@ -358,17 +361,8 @@ async def run_deep_crawl(job_id, url, strategy, max_pages, max_depth, include_pa
     except Exception as e:
         import traceback
         error_details = traceback.format_exc()
-        log(f"Portfolio analysis failed: {str(e)}\n{error_details}")
-        
-        # Add a summary of what we found so far
-        log("\nSummary of findings:")
-        log(f"Number of protocols found: {len(protocols_found)}")
-        if protocols_found:
-            log("Protocols found:")
-            for name, protocol in protocols_found.items():
-                log(f"- {name} ({protocol.category}): ${protocol.tvl:.2f}")
-        else:
-            log("No protocols found matching the criteria.")
+        log(f"Custom crawl failed: {str(e)}")
+        log(error_details)
         
         crawl_jobs[job_id].update({
             "status": "failed",
@@ -400,17 +394,8 @@ async def run_custom_crawl(job_id, url, query, selectors, extraction_strategy, o
     except Exception as e:
         import traceback
         error_details = traceback.format_exc()
-        log(f"Portfolio analysis failed: {str(e)}\n{error_details}")
-        
-        # Add a summary of what we found so far
-        log("\nSummary of findings:")
-        log(f"Number of protocols found: {len(protocols_found)}")
-        if protocols_found:
-            log("Protocols found:")
-            for name, protocol in protocols_found.items():
-                log(f"- {name} ({protocol.category}): ${protocol.tvl:.2f}")
-        else:
-            log("No protocols found matching the criteria.")
+        log(f"Custom crawl failed: {str(e)}")
+        log(error_details)
         
         crawl_jobs[job_id].update({
             "status": "failed",
@@ -462,8 +447,11 @@ async def run_portfolio_analysis(job_id, blockchain_id, assets, include_top_prot
     # Initialize protocols_found dictionary
     protocols_found = {}
     
-    def log(message):
-        print(message)
+    # Create a local log function that also writes to the log file
+    def local_log(message):
+        # Use the global log function
+        log(message)
+        # Also write to the log file
         with open(log_file, "a") as f:
             f.write(f"{message}\n")
     
@@ -477,31 +465,76 @@ async def run_portfolio_analysis(job_id, blockchain_id, assets, include_top_prot
             # Use CustomCrawler with LLM extraction strategy for better analysis
             custom_crawler = CustomCrawler()
             
-            # Check if OpenAI API key is available
-            openai_api_key = os.environ.get("OPENAI_API_KEY", "")
-            if not openai_api_key:
-                log("WARNING: No OpenAI API key found in environment variables. Skipping LLM extraction and using direct HTML parsing.")
-                extraction_strategy = "html"
+            # Get the selected LLM provider from environment
+            llm_provider = os.environ.get("LLM_PROVIDER", "openai").lower()
+            log(f"Using LLM provider: {llm_provider}")
+            
+            # Determine extraction strategy based on provider
+            if llm_provider == "openai":
+                # Check if OpenAI API key is available
+                openai_api_key = os.environ.get("OPENAI_API_KEY", "")
+                if not openai_api_key:
+                    log("WARNING: No OpenAI API key found in environment variables. Skipping LLM extraction and using direct HTML parsing.")
+                    extraction_strategy = "html"
+                else:
+                    log("OpenAI API key found. Using LLM extraction strategy.")
+                    extraction_strategy = "llm"
+            elif llm_provider == "claude":
+                # Check if Claude API key is available
+                claude_api_key = os.environ.get("CLAUDE_API_KEY", "")
+                if not claude_api_key:
+                    log("WARNING: No Claude API key found in environment variables. Skipping LLM extraction and using direct HTML parsing.")
+                    extraction_strategy = "html"
+                else:
+                    log("Claude API key found. Using LLM extraction strategy.")
+                    extraction_strategy = "llm"
+            elif llm_provider == "ollama":
+                # Check if Ollama is available
+                provider = LLMProvider("ollama")
+                if provider.is_ollama_available():
+                    log("Ollama is available. Using LLM extraction strategy.")
+                    extraction_strategy = "llm"
+                else:
+                    log("WARNING: Ollama is not available. Skipping LLM extraction and using direct HTML parsing.")
+                    extraction_strategy = "html"
             else:
-                log("OpenAI API key found. Using LLM extraction strategy.")
-                extraction_strategy = "llm"
+                log(f"WARNING: Unknown LLM provider '{llm_provider}'. Using HTML extraction strategy.")
+                extraction_strategy = "html"
                 
-            # Create an LLM extraction strategy if we have an API key
+            # Create an LLM extraction strategy if needed
             if extraction_strategy == "llm":
+                # Get LLM configuration from our provider module
+                llm_provider_config = get_llm_config(llm_provider)
+
+                log(f"LLM provider config: {llm_provider_config}")
+                
+                # Extract parameters for LLMConfig
+                provider = llm_provider_config.get("provider")
+                api_token = llm_provider_config.get("api_token", "")
+                base_url = llm_provider_config.get("base_url", None)
+                
+                log(f"Creating LLMConfig with provider={provider}, base_url={base_url}")
+                
+                # Create LLMConfig with only the parameters it accepts
+                llm_config = LLMConfig(
+                    provider=provider,
+                    api_token=api_token,
+                    base_url=base_url
+                )
+                
                 llm_extraction_strategy = LLMExtractionStrategy(
-                    llm_config=LLMConfig(
-                        provider="openai/gpt-3.5-turbo",  # You can change to your preferred model
-                        api_token=openai_api_key  # Get API key from environment
-                    ),
+                    llm_config=llm_config,
                     schema=ProtocolList.model_json_schema(),  # Use our Pydantic model schema
                     extraction_type="schema",
                     instruction=f"Extract a list of top DeFi protocols from this page. Focus on protocols available on {blockchain_id}. Include name, TVL (Total Value Locked), category, and other available information. Return the data as a structured JSON object with a 'protocols' array containing protocol objects.",
                     chunk_token_threshold=4000,
                     overlap_rate=0.1,
                     apply_chunking=True,
-                    input_format="html",
-                    extra_args={"temperature": 0.1}
+                    input_format="html"
                 )
+
+                # log llm_extraction_strategy json format
+                log(f"LLM extraction strategy: {llm_extraction_strategy}")
             
             # Perform the crawl with the appropriate extraction strategy
             if extraction_strategy == "llm":
@@ -515,6 +548,19 @@ async def run_portfolio_analysis(job_id, blockchain_id, assets, include_top_prot
                     output_format="json",
                     llm_extraction_strategy=llm_extraction_strategy
                 )
+
+                # Log detailed information about the result structure
+                log(f"Result type: {type(result)}")
+                log(f"Result attributes: {dir(result) if hasattr(result, '__dir__') else 'No attributes'}")
+                log(f"Result dictionary keys: {result.keys() if isinstance(result, dict) else 'Not a dictionary'}")
+                
+                # If result is an object with a to_dict or dict method, use that
+                if hasattr(result, 'to_dict'):
+                    log(f"Result as dictionary: {result.to_dict()}")
+                elif hasattr(result, 'dict'):
+                    log(f"Result as dictionary: {result.dict()}")
+                else:
+                    log(f"Result: {result}")
             else:
                 # Perform the crawl with HTML extraction
                 log("Using direct HTML extraction")
@@ -523,6 +569,18 @@ async def run_portfolio_analysis(job_id, blockchain_id, assets, include_top_prot
                     extraction_strategy="html",  # Use HTML-based extraction
                     output_format="json"
                 )
+                # Log detailed information about the result structure
+                log(f"Result type: {type(result)}")
+                log(f"Result attributes: {dir(result) if hasattr(result, '__dir__') else 'No attributes'}")
+                log(f"Result dictionary keys: {result.keys() if isinstance(result, dict) else 'Not a dictionary'}")
+                
+                # If result is an object with a to_dict or dict method, use that
+                if hasattr(result, 'to_dict'):
+                    log(f"Result as dictionary: {result.to_dict()}")
+                elif hasattr(result, 'dict'):
+                    log(f"Result as dictionary: {result.dict()}")
+                else:
+                    log(f"Result: {result}")
         except Exception as browser_error:
             log(f"Browser automation failed: {str(browser_error)}")
             log("Returning empty investment options array")
@@ -1016,17 +1074,8 @@ async def run_portfolio_analysis(job_id, blockchain_id, assets, include_top_prot
     except Exception as e:
         import traceback
         error_details = traceback.format_exc()
-        log(f"Portfolio analysis failed: {str(e)}\n{error_details}")
-        
-        # Add a summary of what we found so far
-        log("\nSummary of findings:")
-        log(f"Number of protocols found: {len(protocols_found)}")
-        if protocols_found:
-            log("Protocols found:")
-            for name, protocol in protocols_found.items():
-                log(f"- {name} ({protocol.category}): ${protocol.tvl:.2f}")
-        else:
-            log("No protocols found matching the criteria.")
+        log(f"Custom crawl failed: {str(e)}")
+        log(error_details)
         
         crawl_jobs[job_id].update({
             "status": "failed",
