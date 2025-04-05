@@ -491,11 +491,15 @@ async def run_portfolio_analysis(job_id, blockchain_id, assets, include_top_prot
             elif llm_provider == "ollama":
                 # Check if Ollama is available
                 provider = LLMProvider("ollama")
-                if provider.is_ollama_available():
-                    log("Ollama is available. Using LLM extraction strategy.")
+                local_log(f"Checking Ollama availability with provider config: {provider.config}")
+                is_available = provider.is_ollama_available()
+                local_log(f"Ollama available: {is_available}")
+                
+                if is_available:
+                    local_log("Ollama is available. Using LLM extraction strategy.")
                     extraction_strategy = "llm"
                 else:
-                    log("WARNING: Ollama is not available. Skipping LLM extraction and using direct HTML parsing.")
+                    local_log("WARNING: Ollama is not available. Skipping LLM extraction and using direct HTML parsing.")
                     extraction_strategy = "html"
             else:
                 log(f"WARNING: Unknown LLM provider '{llm_provider}'. Using HTML extraction strategy.")
@@ -506,14 +510,15 @@ async def run_portfolio_analysis(job_id, blockchain_id, assets, include_top_prot
                 # Get LLM configuration from our provider module
                 llm_provider_config = get_llm_config(llm_provider)
 
-                log(f"LLM provider config: {llm_provider_config}")
+                local_log(f"LLM provider config: {llm_provider_config}")
                 
                 # Extract parameters for LLMConfig
                 provider = llm_provider_config.get("provider")
                 api_token = llm_provider_config.get("api_token", "")
                 base_url = llm_provider_config.get("base_url", None)
+                extra_args = llm_provider_config.get("extra_args", {})
                 
-                log(f"Creating LLMConfig with provider={provider}, base_url={base_url}")
+                local_log(f"Creating LLMConfig with provider={provider}, base_url={base_url}, extra_args={extra_args}")
                 
                 # Create LLMConfig with only the parameters it accepts
                 llm_config = LLMConfig(
@@ -539,20 +544,206 @@ async def run_portfolio_analysis(job_id, blockchain_id, assets, include_top_prot
             # Perform the crawl with the appropriate extraction strategy
             if extraction_strategy == "llm":
                 # Log the schema being used for extraction
-                log(f"Using schema for extraction: {ProtocolList.model_json_schema()}")
+                local_log(f"Using schema for extraction: {ProtocolList.model_json_schema()}")
+                local_log(f"LLM provider: {llm_provider}, Provider config: {llm_provider_config}")
                 
-                # Perform the crawl with LLM extraction
-                result = await custom_crawler.custom_crawl(
-                    url="https://defillama.com/top-protocols",
-                    extraction_strategy="llm",  # Use LLM-based extraction
-                    output_format="json",
-                    llm_extraction_strategy=llm_extraction_strategy
-                )
+                try:
+                    # Use direct requests to get the HTML content
+                    # This avoids browser automation issues
+                    local_log("Using direct requests to get HTML content...")
+                    html_content = None
+                    try:
+                        import requests
+                        import asyncio
+                        
+                        # Define headers to mimic a browser request
+                        headers = {
+                            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.114 Safari/537.36',
+                            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+                            'Accept-Language': 'en-US,en;q=0.5',
+                            'Connection': 'keep-alive',
+                            'Upgrade-Insecure-Requests': '1',
+                            'Cache-Control': 'max-age=0'
+                        }
+                        
+                        # Run the request in a separate thread to avoid blocking
+                        def fetch_html():
+                            response = requests.get("https://defillama.com/top-protocols", headers=headers, timeout=10)
+                            response.raise_for_status()
+                            return response.text
+                        
+                        # Run the request in a thread pool
+                        loop = asyncio.get_event_loop()
+                        html_content = await loop.run_in_executor(None, fetch_html)
+                        
+                        local_log(f"Successfully fetched HTML content, length: {len(html_content)}")
+                    except Exception as e:
+                        local_log(f"Error fetching HTML directly: {str(e)}")
+                        html_content = None
+                    
+                    # If we have HTML content, use it directly with the LLM
+                    if html_content:
+                        local_log("Using fetched HTML content with Ollama for extraction")
+                        try:
+                            # Create a direct extraction using Ollama
+                            from crawl4ai.llm import LLMClient
+                            
+                            # Create LLM client with our config
+                            llm_client = LLMClient(llm_config)
+                            
+                            # Prepare the prompt with our schema
+                            schema = ProtocolList.model_json_schema()
+                            prompt = f"""Extract information about DeFi protocols from the following HTML content from DeFiLlama's top protocols page.
+                            Focus on protocols available on {blockchain_id} blockchain.
+                            Return the data as a JSON object according to this schema: {schema}
+
+                            HTML Content:
+                            {html_content[:50000]}
+                            """
+                            
+                            local_log("Sending HTML content to Ollama for extraction...")
+                            response = await llm_client.agenerate(prompt)
+                            local_log(f"Received response from Ollama, length: {len(response)}")
+                            
+                            # Try to parse the response as JSON
+                            import json
+                            import re
+                            
+                            # Log the raw response for debugging
+                            local_log(f"Raw Ollama response (first 500 chars): {response[:500]}")
+                            
+                            # Extract JSON from the response if needed
+                            json_match = re.search(r'```json\n(.+?)\n```', response, re.DOTALL)
+                            if json_match:
+                                json_str = json_match.group(1)
+                                local_log(f"Extracted JSON from markdown code block, length: {len(json_str)}")
+                            else:
+                                # Try to find JSON object directly with protocols array
+                                json_match = re.search(r'\{\s*"protocols"\s*:\s*\[.+?\]\s*\}', response, re.DOTALL)
+                                if json_match:
+                                    json_str = json_match.group(0)
+                                    local_log(f"Extracted JSON object directly, length: {len(json_str)}")
+                                else:
+                                    # Try to find any JSON array that might contain protocols
+                                    json_match = re.search(r'\[\s*\{.+?\}\s*(,\s*\{.+?\}\s*)*\]', response, re.DOTALL)
+                                    if json_match:
+                                        json_str = '{"protocols": ' + json_match.group(0) + '}'
+                                        local_log(f"Found JSON array and wrapped it in protocols object, length: {len(json_str)}")
+                                    else:
+                                        # Last resort: try to extract any JSON object
+                                        json_match = re.search(r'\{.+?\}', response, re.DOTALL)
+                                        if json_match:
+                                            json_str = json_match.group(0)
+                                            local_log(f"Extracted any JSON object as fallback, length: {len(json_str)}")
+                                        else:
+                                            json_str = response
+                                            local_log("Using full response as JSON")
+                            
+                            try:
+                                extracted_data = json.loads(json_str)
+                                local_log(f"Successfully parsed JSON response: {extracted_data.keys() if isinstance(extracted_data, dict) else 'Not a dictionary'}")
+                                
+                                # Create a result similar to what custom_crawl would return
+                                result = {
+                                    "url": "https://defillama.com/top-protocols",
+                                    "title": "DeFi Llama - Top Protocols",
+                                    "extracted_data": extracted_data
+                                }
+                            except json.JSONDecodeError as e:
+                                local_log(f"Failed to parse JSON: {str(e)}")
+                                local_log(f"Response snippet: {json_str[:200]}")
+                                # Fall back to standard extraction
+                                result = await custom_crawler.custom_crawl(
+                                    url="https://defillama.com/top-protocols",
+                                    extraction_strategy="html",
+                                    output_format="json"
+                                )
+                        except Exception as e:
+                            local_log(f"Error during direct Ollama extraction: {str(e)}")
+                            # Fall back to standard extraction
+                            result = await custom_crawler.custom_crawl(
+                                url="https://defillama.com/top-protocols",
+                                extraction_strategy="html",
+                                output_format="json"
+                            )
+                    else:
+                        # Fall back to standard LLM extraction (which may use browser automation)
+                        local_log("Starting custom_crawl with LLM extraction strategy...")
+                        try:
+                            # Define the protocol schema
+                            protocol_schema = {
+                                "title": "Protocol",
+                                "type": "object",
+                                "properties": {
+                                    "name": {"type": "string", "description": "The name of the protocol"},
+                                    "tvl": {"type": ["number", "string"], "description": "Total Value Locked in the protocol"},
+                                    "chain": {"type": "string", "description": "The blockchain the protocol runs on"},
+                                    "category": {"type": "string", "description": "The category of the protocol (e.g., DEX, Lending)"},
+                                    "url": {"type": "string", "description": "URL to the protocol's page"}
+                                },
+                                "required": ["name"]
+                            }
+                            
+                            # Create the LLM extraction strategy
+                            llm_strategy = LLMExtractionStrategy(
+                                llm_config=llm_config,
+                                schema=json.dumps(protocol_schema),
+                                extraction_type="list",
+                                instruction=f"Extract all DeFi protocols on the {blockchain_id} blockchain from the content. Include name, tvl, chain, category, and url if available.",
+                                chunk_token_threshold=4000,
+                                overlap_rate=0.1,
+                                apply_chunking=True,
+                                input_format="html",
+                                extra_args={"temperature": 0.0, "max_tokens": 2000}
+                            )
+                            
+                            result = await custom_crawler.custom_crawl(
+                                url="https://defillama.com/top-protocols",
+                                extraction_strategy="llm",  # Use LLM-based extraction
+                                output_format="json",
+                                llm_extraction_strategy=llm_strategy
+                            )
+                            local_log("Completed custom_crawl with LLM extraction strategy")
+                        except Exception as e:
+                            local_log(f"Error during LLM extraction: {str(e)}")
+                            local_log("Falling back to HTML extraction")
+                            result = await custom_crawler.custom_crawl(
+                                url="https://defillama.com/top-protocols",
+                                extraction_strategy="html",
+                                output_format="json"
+                            )
+                except Exception as e:
+                    local_log(f"Error during LLM extraction: {str(e)}")
+                    local_log("Falling back to HTML extraction")
+                    result = await custom_crawler.custom_crawl(
+                        url="https://defillama.com/top-protocols",
+                        extraction_strategy="html",
+                        output_format="json"
+                    )
 
                 # Log detailed information about the result structure
-                log(f"Result type: {type(result)}")
-                log(f"Result attributes: {dir(result) if hasattr(result, '__dir__') else 'No attributes'}")
-                log(f"Result dictionary keys: {result.keys() if isinstance(result, dict) else 'Not a dictionary'}")
+                local_log(f"Result type: {type(result)}")
+                
+                if isinstance(result, dict):
+                    local_log(f"Result dictionary keys: {result.keys()}")
+                    
+                    # Log extracted data if available
+                    if 'extracted_data' in result:
+                        local_log(f"Extracted data type: {type(result['extracted_data'])}")
+                        if isinstance(result['extracted_data'], dict):
+                            local_log(f"Extracted data keys: {result['extracted_data'].keys()}")
+                            
+                            if 'protocols' in result['extracted_data']:
+                                protocols = result['extracted_data']['protocols']
+                                local_log(f"Found {len(protocols)} protocols in extracted data")
+                                
+                                # Log the first few protocols for debugging
+                                for i, protocol in enumerate(protocols[:3]):
+                                    local_log(f"Protocol {i+1}: {protocol}")
+                        elif isinstance(result['extracted_data'], str):
+                            local_log(f"Extracted data as string (first 200 chars): {result['extracted_data'][:200]}")
+                else:
+                    local_log(f"Result is not a dictionary: {result}")
                 
                 # If result is an object with a to_dict or dict method, use that
                 if hasattr(result, 'to_dict'):
@@ -570,9 +761,28 @@ async def run_portfolio_analysis(job_id, blockchain_id, assets, include_top_prot
                     output_format="json"
                 )
                 # Log detailed information about the result structure
-                log(f"Result type: {type(result)}")
-                log(f"Result attributes: {dir(result) if hasattr(result, '__dir__') else 'No attributes'}")
-                log(f"Result dictionary keys: {result.keys() if isinstance(result, dict) else 'Not a dictionary'}")
+                local_log(f"Result type: {type(result)}")
+                
+                if isinstance(result, dict):
+                    local_log(f"Result dictionary keys: {result.keys()}")
+                    
+                    # Log extracted data if available
+                    if 'extracted_data' in result:
+                        local_log(f"Extracted data type: {type(result['extracted_data'])}")
+                        if isinstance(result['extracted_data'], dict):
+                            local_log(f"Extracted data keys: {result['extracted_data'].keys()}")
+                            
+                            if 'protocols' in result['extracted_data']:
+                                protocols = result['extracted_data']['protocols']
+                                local_log(f"Found {len(protocols)} protocols in extracted data")
+                                
+                                # Log the first few protocols for debugging
+                                for i, protocol in enumerate(protocols[:3]):
+                                    local_log(f"Protocol {i+1}: {protocol}")
+                        elif isinstance(result['extracted_data'], str):
+                            local_log(f"Extracted data as string (first 200 chars): {result['extracted_data'][:200]}")
+                else:
+                    local_log(f"Result is not a dictionary: {result}")
                 
                 # If result is an object with a to_dict or dict method, use that
                 if hasattr(result, 'to_dict'):
@@ -738,37 +948,127 @@ async def run_portfolio_analysis(job_id, blockchain_id, assets, include_top_prot
                 # Check if we have a protocols list in the extracted data
                 if isinstance(extracted_data, dict) and "protocols" in extracted_data:
                     protocols_list = extracted_data["protocols"]
-                    log(f"Found {len(protocols_list)} protocols in extracted data")
+                    local_log(f"Found {len(protocols_list)} protocols in extracted data dictionary")
+                    
+                    # Log a sample of protocols for debugging
+                    if protocols_list:
+                        local_log(f"Sample protocol: {protocols_list[0]}")
                 elif isinstance(extracted_data, list):
                     # If the extracted data is already a list, use it directly
                     protocols_list = extracted_data
-                    log(f"Extracted data is a list with {len(protocols_list)} items")
+                    local_log(f"Extracted data is a list with {len(protocols_list)} items")
+                    
+                    # Check if the list items look like protocols
+                    if protocols_list and isinstance(protocols_list[0], dict):
+                        if "name" in protocols_list[0]:
+                            local_log(f"List items appear to be protocols with 'name' field")
+                        else:
+                            local_log(f"List items don't have 'name' field, keys: {protocols_list[0].keys()}")
+                    else:
+                        local_log(f"List items are not dictionaries: {type(protocols_list[0]) if protocols_list else 'empty list'}")
                 else:
-                    log(f"Extracted data structure: {type(extracted_data)}")
+                    # Try to find protocols in other structures
+                    local_log(f"Extracted data structure: {type(extracted_data)}")
                     protocols_list = []
+                    
+                    # If it's a dictionary, look for any list that might contain protocols
+                    if isinstance(extracted_data, dict):
+                        for key, value in extracted_data.items():
+                            if isinstance(value, list) and value and isinstance(value[0], dict):
+                                local_log(f"Found potential protocols list in key: {key}")
+                                protocols_list = value
+                                break
                 
                 # Process each protocol
                 for protocol in protocols_list:
                     if len(protocols_found) >= include_top_protocols:
                         break
-                        
-                    # Skip protocols that don't match the requested blockchain
-                    if "chain" in protocol and protocol["chain"].lower() != blockchain_id.lower():
-                        # Skip protocols that don't match the blockchain
+                    
+                    # Log the protocol for debugging
+                    local_log(f"Processing protocol: {protocol}")
+                    
+                    # Handle different data structures flexibly
+                    if not isinstance(protocol, dict):
+                        local_log(f"Skipping non-dictionary protocol: {protocol}")
                         continue
-                        
-                    protocol_name = protocol.get("name", "")
-                    if protocol_name and protocol_name not in protocols_found:
-                        # Create an investment option from the protocol
-                        protocols_found[protocol_name] = InvestmentOption(
-                            protocol_name=protocol_name,
-                            tvl=protocol.get("tvl", 0.0),
-                            chain=blockchain_id,
-                            category=protocol.get("category", "DeFi"),
-                            url=protocol.get("url", f"https://defillama.com/protocol/{protocol_name.lower().replace(' ', '-')}"),
-                            description=protocol.get("description", f"Investment opportunity in {protocol_name} on {blockchain_id}")
-                        )
-                        log(f"Added {protocol_name} to investment options from LLM extraction")
+                    
+                    # Try to find the protocol name in various fields
+                    protocol_name = None
+                    for name_field in ["name", "protocol_name", "protocol", "title"]:
+                        if name_field in protocol and protocol[name_field]:
+                            protocol_name = protocol[name_field]
+                            break
+                    
+                    # If we still don't have a name, try to infer it from other fields
+                    if not protocol_name and "url" in protocol:
+                        # Try to extract name from URL
+                        url_path = protocol["url"].split("/")[-1]
+                        if url_path:
+                            protocol_name = url_path.replace("-", " ").title()
+                    
+                    if not protocol_name:
+                        local_log("Could not determine protocol name, skipping")
+                        continue
+                    
+                    # Skip protocols that don't match the requested blockchain if chain is specified
+                    chain_fields = ["chain", "blockchain", "network"]
+                    skip_protocol = False
+                    
+                    for chain_field in chain_fields:
+                        if chain_field in protocol and protocol[chain_field]:
+                            protocol_chain = str(protocol[chain_field]).lower()
+                            if protocol_chain != blockchain_id.lower() and protocol_chain != "multiple":
+                                local_log(f"Skipping protocol {protocol_name} with chain {protocol_chain} != {blockchain_id}")
+                                skip_protocol = True
+                                break
+                    
+                    if skip_protocol:
+                        continue
+                    
+                    # Skip if we already have this protocol
+                    if protocol_name in protocols_found:
+                        continue
+                    
+                    # Get TVL value, handling different formats
+                    tvl_value = 0.0
+                    for tvl_field in ["tvl", "total_value_locked", "value"]:
+                        if tvl_field in protocol:
+                            tvl_raw = protocol[tvl_field]
+                            if isinstance(tvl_raw, (int, float)):
+                                tvl_value = float(tvl_raw)
+                                break
+                            elif isinstance(tvl_raw, str):
+                                # Try to clean and parse the string
+                                tvl_str = tvl_raw.replace("$", "").replace(",", "")
+                                try:
+                                    if "b" in tvl_str.lower() or "billion" in tvl_str.lower():
+                                        # Handle billions format
+                                        tvl_str = tvl_str.lower().replace("b", "").replace("illion", "")
+                                        tvl_value = float(tvl_str) * 1_000_000_000
+                                    elif "m" in tvl_str.lower() or "million" in tvl_str.lower():
+                                        # Handle millions format
+                                        tvl_str = tvl_str.lower().replace("m", "").replace("illion", "")
+                                        tvl_value = float(tvl_str) * 1_000_000
+                                    elif "k" in tvl_str.lower() or "thousand" in tvl_str.lower():
+                                        # Handle thousands format
+                                        tvl_str = tvl_str.lower().replace("k", "").replace("thousand", "")
+                                        tvl_value = float(tvl_str) * 1_000
+                                    else:
+                                        tvl_value = float(tvl_str)
+                                    break
+                                except (ValueError, TypeError):
+                                    pass
+                    
+                    # Create an investment option from the protocol
+                    protocols_found[protocol_name] = InvestmentOption(
+                        protocol_name=protocol_name,
+                        tvl=tvl_value,
+                        chain=blockchain_id,
+                        category=protocol.get("category", protocol.get("type", "DeFi")),
+                        url=protocol.get("url", f"https://defillama.com/protocol/{protocol_name.lower().replace(' ', '-')}"),
+                        description=protocol.get("description", protocol.get("desc", f"Investment opportunity in {protocol_name} on {blockchain_id}"))
+                    )
+                    local_log(f"Added {protocol_name} to investment options with TVL: {tvl_value}")
                 if not protocols_list:
                     log("No protocols list found in extracted data")
             else:
@@ -803,12 +1103,15 @@ async def run_portfolio_analysis(job_id, blockchain_id, assets, include_top_prot
                         log("Using HTML from extracted_data instead")
                         html_content = extracted_data["html"]
                         soup = BeautifulSoup(html_content, "html.parser")
-                    # Try to use the entire JSON as the content
-                    soup = BeautifulSoup(str(content_json), "html.parser")
-            except json.JSONDecodeError:
-                log("Content is not in JSON format, using as raw HTML")
-                # Extract protocol information from the table
-                soup = BeautifulSoup(main_page_result["content"], "html.parser")
+                    else:
+                        # Use the raw extracted_data as a fallback
+                        log("Using raw extracted_data as fallback")
+                        soup = BeautifulSoup(str(extracted_data), "html.parser")
+            except Exception as e:
+                log(f"Error processing content: {str(e)}")
+                log("Error occurred, creating empty soup object")
+                # Create an empty soup object as a fallback
+                soup = BeautifulSoup("", "html.parser")
             
             # Log debugging information about the parsed HTML
             log(f"Found tables: {len(soup.find_all('table'))}")
