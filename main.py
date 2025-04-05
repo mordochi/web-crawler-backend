@@ -517,54 +517,337 @@ async def run_portfolio_analysis(job_id, blockchain_id, assets, include_top_prot
         with open(log_file, "a") as f:
             f.write(f"{message}\n")
     
-    # Function to extract investment options from cached HTML
-    def extract_from_cached_html(html_content):
+    # Function to extract investment options from HTML using BeautifulSoup as a fallback method
+    def extract_from_html_fallback(html_content):
         try:
+            local_log("Using BeautifulSoup fallback to extract investment options from HTML")
             soup = BeautifulSoup(html_content, 'html.parser')
-            table = soup.find('table')
             
-            if not table:
-                local_log("No table found in cached HTML")
+            # Try different approaches to find protocol data
+            investment_options = []
+            
+            # Approach 1: Look for tables with protocol data
+            tables = soup.find_all('table')
+            local_log(f"Found {len(tables)} tables in HTML")
+            
+            for table in tables:
+                try:
+                    # Check if this table has relevant headers
+                    headers = [th.text.strip().lower() for th in table.find_all('th')]
+                    if not headers or not any(keyword in ' '.join(headers) for keyword in ['protocol', 'tvl', 'chain']):
+                        continue
+                    
+                    local_log(f"Found table with relevant headers: {headers}")
+                    rows = table.find_all('tr')[1:]  # Skip header row
+                    
+                    for i, row in enumerate(rows):
+                        if i >= include_top_protocols:
+                            break
+                            
+                        cells = row.find_all('td')
+                        if len(cells) < 3:
+                            continue
+                        
+                        # Try to identify which columns contain what data
+                        name_idx, tvl_idx, chain_idx, category_idx = 0, 1, 2, 3
+                        
+                        # Adjust indices based on headers if available
+                        if headers:
+                            for idx, header in enumerate(headers):
+                                if 'name' in header or 'protocol' in header:
+                                    name_idx = idx
+                                elif 'tvl' in header or 'value' in header:
+                                    tvl_idx = idx
+                                elif 'chain' in header or 'blockchain' in header:
+                                    chain_idx = idx
+                                elif 'category' in header or 'type' in header:
+                                    category_idx = idx
+                        
+                        # Extract data with safeguards for index out of range
+                        name = cells[name_idx].text.strip() if name_idx < len(cells) else ''
+                        tvl_text = cells[tvl_idx].text.strip() if tvl_idx < len(cells) else ''
+                        chain_text = cells[chain_idx].text.strip() if chain_idx < len(cells) else ''
+                        category = cells[category_idx].text.strip() if category_idx < len(cells) and category_idx < len(cells) else 'DeFi'
+                        
+                        # Skip if no name or if chain doesn't match
+                        if not name:
+                            continue
+                            
+                        # Handle the case where chain might be a comma-separated list
+                        if blockchain_id.lower() in chain_text.lower() or not chain_text:
+                            chain = blockchain_id
+                        else:
+                            # Skip protocols not on the requested blockchain
+                            continue
+                        
+                        # Create URL from protocol name
+                        url = f"https://defillama.com/protocol/{name.lower().replace(' ', '-')}"
+                        
+                        option = InvestmentOption(
+                            protocol_name=name,
+                            tvl=tvl_text if tvl_text else 0,
+                            chain=chain,
+                            category=category if category else 'DeFi',
+                            url=url,
+                            description=f"Investment opportunity in {name} on {blockchain_id}"
+                        )
+                        investment_options.append(option)
+                        
+                    if investment_options:
+                        local_log(f"Successfully extracted {len(investment_options)} investment options from table")
+                        return investment_options
+                except Exception as e:
+                    local_log(f"Error processing table: {str(e)}")
+            
+            # Approach 2: Look for divs with protocol data (common in modern websites)
+            if not investment_options:
+                local_log("Trying to extract from divs/sections")
+                # Look for sections or divs that might contain protocol listings
+                protocol_sections = soup.find_all(['div', 'section'], class_=lambda c: c and any(keyword in c.lower() for keyword in ['protocols', 'projects', 'listing', 'table']))
+                
+                for section in protocol_sections:
+                    try:
+                        # Look for protocol items
+                        protocol_items = section.find_all(['div', 'a'], class_=lambda c: c and any(keyword in c.lower() for keyword in ['item', 'row', 'protocol', 'card']))
+                        
+                        for i, item in enumerate(protocol_items):
+                            if i >= include_top_protocols:
+                                break
+                                
+                            # Try to find protocol name
+                            name_elem = item.find(['h3', 'h4', 'strong', 'span'], class_=lambda c: c and ('name' in c.lower() if c else False))
+                            name = name_elem.text.strip() if name_elem else ''
+                            
+                            if not name:
+                                # Try alternative approaches to find the name
+                                name_elem = item.find(['h3', 'h4', 'strong', 'span'])
+                                name = name_elem.text.strip() if name_elem else ''
+                            
+                            # Skip if no name found
+                            if not name:
+                                continue
+                                
+                            # Try to find TVL
+                            tvl_elem = item.find(['span', 'div'], string=lambda s: s and ('$' in s or 'tvl' in s.lower() if s else False))
+                            tvl_text = tvl_elem.text.strip() if tvl_elem else '0'
+                            
+                            # Try to find chain
+                            chain_elem = item.find(['span', 'div'], string=lambda s: s and blockchain_id.lower() in s.lower() if s else False)
+                            chain = blockchain_id  # Default to requested blockchain
+                            
+                            # Try to find category
+                            category_elem = item.find(['span', 'div'], class_=lambda c: c and ('category' in c.lower() or 'type' in c.lower() if c else False))
+                            category = category_elem.text.strip() if category_elem else 'DeFi'
+                            
+                            # Create URL from protocol name
+                            url = f"https://defillama.com/protocol/{name.lower().replace(' ', '-')}"
+                            
+                            option = InvestmentOption(
+                                protocol_name=name,
+                                tvl=tvl_text if tvl_text else 0,
+                                chain=chain,
+                                category=category if category else 'DeFi',
+                                url=url,
+                                description=f"Investment opportunity in {name} on {blockchain_id}"
+                            )
+                            investment_options.append(option)
+                    except Exception as e:
+                        local_log(f"Error processing section: {str(e)}")
+            
+            local_log(f"Fallback extraction found {len(investment_options)} investment options")
+            return investment_options
+        except Exception as e:
+            local_log(f"Error in HTML fallback extraction: {str(e)}")
+            import traceback
+            local_log(traceback.format_exc())
+            return []
+    
+    # Function to extract data using LLM
+    async def extract_with_llm(prompt):
+        try:
+            local_log("Extracting data with LLM")
+            
+            # Import necessary modules
+            import os
+            import json
+            
+            # Get the selected LLM provider from environment
+            llm_provider = os.environ.get("LLM_PROVIDER", "openai").lower()
+            local_log(f"Using LLM provider: {llm_provider}")
+            
+            # Get LLM configuration
+            llm_provider_config = get_llm_config(llm_provider)
+            
+            # Extract parameters for LLMConfig
+            provider = llm_provider_config.get("provider")
+            api_token = llm_provider_config.get("api_token", "")
+            base_url = llm_provider_config.get("base_url", None)
+            extra_args = llm_provider_config.get("extra_args", {})
+            
+            # Create LLMConfig for the extraction
+            config_args = {}
+            if api_token:
+                config_args['api_token'] = api_token
+            if base_url:
+                config_args['base_url'] = base_url
+                
+            llm_config = LLMConfig(
+                provider=provider,
+                **config_args
+            )
+            
+            # Create a custom crawler to handle the LLM extraction
+            from crawlers import CustomCrawler
+            crawler = CustomCrawler()
+            
+            # Create a simple extraction strategy for text generation
+            extraction_strategy = LLMExtractionStrategy(
+                llm_config=llm_config,
+                extraction_type="text",
+                instruction=prompt,
+                apply_chunking=False,
+                input_format="text",
+                extra_args=extra_args
+            )
+            
+            # Use a dummy URL since we're just processing the prompt
+            dummy_text = f"<html><body>{prompt}</body></html>"
+            
+            # Create a temporary HTML file with the prompt
+            import tempfile
+            with tempfile.NamedTemporaryFile(suffix='.html', delete=False, mode='w') as f:
+                f.write(dummy_text)
+                temp_file = f.name
+            
+            # Use file:// protocol to read the local file
+            file_url = f"file://{temp_file}"
+            
+            # Execute the extraction using the crawler
+            result = await crawler.custom_crawl(
+                url=file_url,
+                extraction_strategy="llm",
+                llm_extraction_strategy=extraction_strategy
+            )
+            
+            # Clean up the temporary file
+            os.unlink(temp_file)
+            
+            # Extract the response from the result
+            if isinstance(result, dict) and 'content' in result:
+                response = result['content']
+            elif isinstance(result, dict) and 'extracted_data' in result:
+                response = json.dumps(result['extracted_data'])
+            else:
+                response = str(result)
+            
+            local_log(f"Received response from LLM, length: {len(response) if response else 0}")
+            return response
+        except Exception as e:
+            local_log(f"Error in extract_with_llm: {str(e)}")
+            import traceback
+            local_log(traceback.format_exc())
+            return None
+    
+    # Function to extract investment options from cached HTML using LLM
+    async def extract_from_cached_html(html_content):
+        try:
+            local_log("Using LLM to extract investment options from HTML")
+            
+            # Prepare the prompt with our schema
+            prompt = f"""
+            Extract investment options from the following HTML content from DeFiLlama's top protocols page.
+            Focus on protocols available on the {blockchain_id} blockchain.
+            
+            For each protocol, extract:
+            1. Protocol name
+            2. TVL (Total Value Locked) - a number or string
+            3. Chain - should be {blockchain_id} or include {blockchain_id}
+            4. Category (e.g., Lending, DEX, etc.)
+            
+            Return the results as a JSON array with objects having these properties:
+            - protocol_name: string
+            - tvl: number or string
+            - chain: string (should be {blockchain_id})
+            - category: string
+            - url: string (format as https://defillama.com/protocol/protocol-name)
+            
+            Only include the top {include_top_protocols} protocols by TVL.
+            Only include protocols that are available on the {blockchain_id} blockchain.
+            
+            HTML Content:
+            {html_content[:50000]}
+            """
+            
+            # Use the existing LLM integration in the codebase
+            try:
+                # Try using direct LLM extraction
+                local_log(f"Using fetched HTML content with {os.environ.get('LLM_PROVIDER', 'OpenAI')} for extraction")
+                llm_response = await extract_with_llm(prompt)
+                if not llm_response:
+                    raise Exception("No response from LLM")
+                local_log(f"Received response from LLM, length: {len(llm_response)}")
+            except Exception as e:
+                local_log(f"Error during direct LLM extraction: {str(e)}")
+                # If direct extraction fails, try to fall back to HTML parsing
+                local_log("Falling back to HTML extraction")
+                return extract_from_html_fallback(html_content)
+            
+            # Try to parse the JSON response
+            # First, find JSON content between triple backticks if present
+            import re
+            import json
+            
+            # Try to extract JSON from the response
+            json_match = re.search(r'```(?:json)?\s*([\s\S]*?)\s*```', llm_response)
+            if json_match:
+                json_str = json_match.group(1)
+            else:
+                # If no triple backticks, try to find a JSON array directly
+                json_match = re.search(r'\[\s*{[\s\S]*}\s*\]', llm_response)
+                if json_match:
+                    json_str = json_match.group(0)
+                else:
+                    # Last resort: assume the entire response is JSON
+                    json_str = llm_response
+            
+            # Clean up the string and parse JSON
+            try:
+                protocols_data = json.loads(json_str)
+                local_log(f"Successfully parsed JSON with {len(protocols_data)} protocols")
+            except json.JSONDecodeError as e:
+                local_log(f"Failed to parse JSON: {str(e)}")
+                local_log(f"JSON string: {json_str[:200]}...")
                 return []
             
-            rows = table.find_all('tr')[1:]  # Skip header row
-            local_log(f"Found {len(rows)} protocol rows in cached HTML")
-            
+            # Convert to InvestmentOption objects
             investment_options = []
-            for i, row in enumerate(rows):
-                if i >= include_top_protocols:
-                    break
-                    
-                cells = row.find_all('td')
-                if len(cells) >= 4:
-                    name = cells[0].text.strip()
-                    tvl_text = cells[1].text.strip()
-                    chain_text = cells[2].text.strip()
-                    category = cells[3].text.strip()
-                    
-                    # Handle the case where chain might be a comma-separated list
-                    if blockchain_id.lower() in chain_text.lower() or not chain_text:
-                        chain = blockchain_id
-                    else:
-                        chain = blockchain_id  # Default to requested blockchain
-                    
-                    # Create URL from protocol name
-                    url = f"https://defillama.com/protocol/{name.lower().replace(' ', '-')}"
+            for protocol in protocols_data:
+                try:
+                    name = protocol.get('protocol_name', '')
+                    tvl = protocol.get('tvl', 0)
+                    chain = protocol.get('chain', blockchain_id)
+                    category = protocol.get('category', 'DeFi')
+                    url = protocol.get('url', f"https://defillama.com/protocol/{name.lower().replace(' ', '-')}")
+                    description = protocol.get('description', f"Investment opportunity in {name} on {blockchain_id}")
                     
                     option = InvestmentOption(
                         protocol_name=name,
-                        tvl=tvl_text if tvl_text else 0,
+                        tvl=tvl,
                         chain=chain,
-                        category=category if category else 'DeFi',
+                        category=category,
                         url=url,
-                        description=f"Investment opportunity in {name} on {blockchain_id}"
+                        description=description
                     )
                     investment_options.append(option)
+                except Exception as e:
+                    local_log(f"Error creating InvestmentOption: {str(e)}")
             
-            local_log(f"Successfully extracted {len(investment_options)} investment options from cached data")
+            local_log(f"Successfully created {len(investment_options)} investment options from LLM extraction")
             return investment_options
         except Exception as e:
-            local_log(f"Error parsing cached HTML: {str(e)}")
+            local_log(f"Error using LLM to extract from HTML: {str(e)}")
+            import traceback
+            local_log(traceback.format_exc())
             return []
     
     try:
@@ -864,23 +1147,22 @@ async def run_portfolio_analysis(job_id, blockchain_id, assets, include_top_prot
                         
                         if is_cached_data:
                             local_log("Detected cached data in HTML - using direct extraction")
-                            investment_options = extract_from_cached_html(html_content)
+                            investment_options = await extract_from_cached_html(html_content)
                             if investment_options:
                                 local_log(f"Successfully extracted {len(investment_options)} investment options from cached HTML")
                                 
                                 # Update job status to completed
-                                job.status = "completed"
-                                job.end_time = datetime.now().isoformat()
-                                job.result = {
+                                crawl_jobs[job_id]["status"] = "completed"
+                                crawl_jobs[job_id]["end_time"] = datetime.now().isoformat()
+                                crawl_jobs[job_id]["result"] = {
                                     "job_id": job_id,
                                     "status": "completed",
                                     "blockchain_id": blockchain_id,
                                     "user_assets": [asset.dict() for asset in assets],
                                     "investment_options": [option.dict() for option in investment_options],
-                                    "start_time": job.start_time,
-                                    "end_time": job.end_time
+                                    "start_time": crawl_jobs[job_id]["start_time"],
+                                    "end_time": crawl_jobs[job_id]["end_time"]
                                 }
-                                jobs[job_id] = job
                                 local_log(f"Job status updated to completed with {len(investment_options)} investment options")
                                 return investment_options
                     except Exception as e:
