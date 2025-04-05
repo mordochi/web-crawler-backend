@@ -109,3 +109,6 @@ venv.bak/
 # Project specific
 portfolio_analysis_*.log
 crawl_*.log
+
+# Database
+protocol_cache.db
