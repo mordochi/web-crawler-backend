@@ -7,8 +7,13 @@ import uuid
 import os
 import json
 import re
-from datetime import datetime
+import time
+import sqlite3
+from datetime import datetime, timedelta
 from dotenv import load_dotenv
+
+# Import the database cache
+from db_cache import DBCache
 
 # Load environment variables from .env file
 load_dotenv()
@@ -30,6 +35,9 @@ def log(message):
     logger.info(message)
 
 app = FastAPI(title="Web Crawler Backend", description="Backend API for crawling websites using crawl4ai")
+
+# Initialize the database cache
+protocol_cache = DBCache(db_path="protocol_cache.db", cache_expiry_hours=24)
 
 # Add CORS middleware
 app.add_middleware(
@@ -300,6 +308,60 @@ async def get_crawl_status(job_id: str):
         # For regular crawl jobs
         return job
 
+# Cache management endpoints
+@app.get("/api/cache/stats")
+async def get_cache_stats():
+    """Get statistics about the protocol cache."""
+    try:
+        stats = protocol_cache.get_cache_stats()
+        return {
+            "status": "success",
+            "stats": stats
+        }
+    except Exception as e:
+        return {
+            "status": "error",
+            "message": str(e)
+        }
+
+@app.delete("/api/cache/expired")
+async def clear_expired_cache():
+    """Clear expired cache entries."""
+    try:
+        protocol_cache.clear_expired_cache()
+        stats = protocol_cache.get_cache_stats()
+        return {
+            "status": "success",
+            "message": "Expired cache entries cleared",
+            "stats": stats
+        }
+    except Exception as e:
+        return {
+            "status": "error",
+            "message": str(e)
+        }
+
+@app.delete("/api/cache/all")
+async def clear_all_cache():
+    """Clear all cache entries."""
+    try:
+        conn = sqlite3.connect(protocol_cache.db_path)
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM protocol_cache")
+        deleted_count = cursor.rowcount
+        conn.commit()
+        conn.close()
+        
+        return {
+            "status": "success",
+            "message": f"All cache entries cleared ({deleted_count} entries)"
+        }
+    except Exception as e:
+        return {
+            "status": "error",
+            "message": str(e)
+        }
+
 async def run_simple_crawl(job_id, url, output_format, wait_for_seconds, capture_screenshot, extract_metadata):
     crawl_jobs[job_id]["status"] = "running"
     
@@ -455,6 +517,56 @@ async def run_portfolio_analysis(job_id, blockchain_id, assets, include_top_prot
         with open(log_file, "a") as f:
             f.write(f"{message}\n")
     
+    # Function to extract investment options from cached HTML
+    def extract_from_cached_html(html_content):
+        try:
+            soup = BeautifulSoup(html_content, 'html.parser')
+            table = soup.find('table')
+            
+            if not table:
+                local_log("No table found in cached HTML")
+                return []
+            
+            rows = table.find_all('tr')[1:]  # Skip header row
+            local_log(f"Found {len(rows)} protocol rows in cached HTML")
+            
+            investment_options = []
+            for i, row in enumerate(rows):
+                if i >= include_top_protocols:
+                    break
+                    
+                cells = row.find_all('td')
+                if len(cells) >= 4:
+                    name = cells[0].text.strip()
+                    tvl_text = cells[1].text.strip()
+                    chain_text = cells[2].text.strip()
+                    category = cells[3].text.strip()
+                    
+                    # Handle the case where chain might be a comma-separated list
+                    if blockchain_id.lower() in chain_text.lower() or not chain_text:
+                        chain = blockchain_id
+                    else:
+                        chain = blockchain_id  # Default to requested blockchain
+                    
+                    # Create URL from protocol name
+                    url = f"https://defillama.com/protocol/{name.lower().replace(' ', '-')}"
+                    
+                    option = InvestmentOption(
+                        protocol_name=name,
+                        tvl=tvl_text if tvl_text else 0,
+                        chain=chain,
+                        category=category if category else 'DeFi',
+                        url=url,
+                        description=f"Investment opportunity in {name} on {blockchain_id}"
+                    )
+                    investment_options.append(option)
+            
+            local_log(f"Successfully extracted {len(investment_options)} investment options from cached data")
+            return investment_options
+        except Exception as e:
+            local_log(f"Error parsing cached HTML: {str(e)}")
+            return []
+    
     try:
         # No hardcoded protocols - we'll return empty array if none found
         
@@ -556,27 +668,221 @@ async def run_portfolio_analysis(job_id, blockchain_id, assets, include_top_prot
                         import requests
                         import asyncio
                         
-                        # Define headers to mimic a browser request
+                        # Define headers to mimic a browser request more convincingly
                         headers = {
-                            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.114 Safari/537.36',
-                            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-                            'Accept-Language': 'en-US,en;q=0.5',
-                            'Connection': 'keep-alive',
+                            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36',
+                            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
+                            'Accept-Language': 'en-US,en;q=0.9',
+                            'Accept-Encoding': 'gzip, deflate, br',
+                            'Referer': 'https://www.google.com/',
+                            'sec-ch-ua': '"Google Chrome";v="123", "Not:A-Brand";v="8", "Chromium";v="123"',
+                            'sec-ch-ua-mobile': '?0',
+                            'sec-ch-ua-platform': '"Windows"',
+                            'sec-fetch-dest': 'document',
+                            'sec-fetch-mode': 'navigate',
+                            'sec-fetch-site': 'cross-site',
+                            'sec-fetch-user': '?1',
                             'Upgrade-Insecure-Requests': '1',
-                            'Cache-Control': 'max-age=0'
+                            'Connection': 'keep-alive',
+                            'Cache-Control': 'max-age=0',
+                            'dnt': '1'
                         }
                         
                         # Run the request in a separate thread to avoid blocking
                         def fetch_html():
-                            response = requests.get("https://defillama.com/top-protocols", headers=headers, timeout=10)
-                            response.raise_for_status()
-                            return response.text
+                            url = "https://defillama.com/top-protocols"
+                            api_url = "https://api.llama.fi/protocols"
+                            
+                            # Extract asset symbols from the assets parameter
+                            asset_symbols = [asset.asset_id for asset in assets]
+                            local_log(f"Asset symbols: {asset_symbols}")
+                            
+                            # First, check if we have a valid cache entry
+                            local_log(f"Checking cache for {url} with blockchain_id={blockchain_id} and asset_symbols={asset_symbols}")
+                            cached_data = protocol_cache.get_cached_protocols(api_url, blockchain_id, asset_symbols)
+                            
+                            if cached_data:
+                                local_log(f"Using cached data for {url} with blockchain_id={blockchain_id}")
+                                
+                                # Create HTML from cached data
+                                html = "<html><body><h1>DeFi Llama Top Protocols (Cached)</h1><table>"
+                                html += "<tr><th>Name</th><th>TVL</th><th>Chain</th><th>Category</th></tr>"
+                                
+                                # Process the cached data based on its structure
+                                if isinstance(cached_data, list):
+                                    protocols = cached_data
+                                elif isinstance(cached_data, dict) and 'protocols' in cached_data:
+                                    protocols = cached_data['protocols']
+                                else:
+                                    protocols = []
+                                    
+                                for protocol in protocols:
+                                    name = protocol.get('name', '')
+                                    tvl = protocol.get('tvl', 0)
+                                    chains = ", ".join(protocol.get('chains', [])) if isinstance(protocol.get('chains'), list) else protocol.get('chain', '')
+                                    category = protocol.get('category', '')
+                                    html += f"<tr><td>{name}</td><td>{tvl}</td><td>{chains}</td><td>{category}</td></tr>"
+                                
+                                html += "</table></body></html>"
+                                return html
+                            
+                            # If no cache or cache expired, try to fetch fresh data
+                            local_log("No valid cache found, fetching fresh data...")
+                            
+                            # Try multiple approaches to get the HTML
+                            try:
+                                # First attempt with standard requests
+                                session = requests.Session()
+                                response = session.get(url, 
+                                                      headers=headers, 
+                                                      timeout=15,
+                                                      allow_redirects=True)
+                                response.raise_for_status()
+                                local_log("Successfully fetched HTML content with standard request")
+                                
+                                # Don't cache the HTML directly as it's too large and not structured
+                                return response.text
+                            except Exception as e:
+                                local_log(f"First attempt failed: {str(e)}")
+                                
+                                # Second attempt with different User-Agent
+                                try:
+                                    mobile_headers = headers.copy()
+                                    mobile_headers['User-Agent'] = 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1'
+                                    mobile_headers['sec-ch-ua-mobile'] = '?1'
+                                    mobile_headers['sec-ch-ua-platform'] = '"iOS"'
+                                    
+                                    session = requests.Session()
+                                    response = session.get(url, 
+                                                          headers=mobile_headers, 
+                                                          timeout=15,
+                                                          allow_redirects=True)
+                                    response.raise_for_status()
+                                    local_log("Successfully fetched HTML content with mobile user agent")
+                                    
+                                    # Don't cache the HTML directly as it's too large and not structured
+                                    return response.text
+                                except Exception as e2:
+                                    local_log(f"Second attempt failed: {str(e2)}")
+                                    
+                                    # Try using the API endpoint instead
+                                    try:
+                                        api_headers = {
+                                            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36',
+                                            'Accept': 'application/json',
+                                            'Referer': 'https://defillama.com/'
+                                        }
+                                        response = session.get(api_url, 
+                                                              headers=api_headers, 
+                                                              timeout=15)
+                                        response.raise_for_status()
+                                        
+                                        # Convert API response to HTML format for processing
+                                        api_data = response.json()
+                                        local_log(f"Successfully fetched API data with {len(api_data)} protocols")
+                                        
+                                        # Extract asset symbols from the assets parameter
+                                        asset_symbols = [asset.asset_id for asset in assets]
+                                        
+                                        # Cache the API data for future use
+                                        protocol_cache.cache_protocols(api_url, api_data, blockchain_id, asset_symbols, source="api")
+                                        local_log(f"Cached {len(api_data)} protocols for future use with asset_symbols={asset_symbols}")
+                                        
+                                        # Create a simple HTML table from the API data
+                                        html = "<html><body><h1>DeFi Llama Top Protocols</h1><table>"
+                                        html += "<tr><th>Name</th><th>TVL</th><th>Chain</th><th>Category</th></tr>"
+                                        
+                                        for protocol in api_data:
+                                            name = protocol.get('name', '')
+                                            tvl = protocol.get('tvl', 0)
+                                            chains = ", ".join(protocol.get('chains', []))
+                                            category = protocol.get('category', '')
+                                            html += f"<tr><td>{name}</td><td>{tvl}</td><td>{chains}</td><td>{category}</td></tr>"
+                                        
+                                        html += "</table></body></html>"
+                                        return html
+                                    except Exception as e3:
+                                        local_log(f"API attempt failed: {str(e3)}")
+                                        
+                                        # If all live attempts fail, try to use an expired cache as last resort
+                                        local_log("All fetch attempts failed, checking for expired cache...")
+                                        conn = sqlite3.connect(protocol_cache.db_path)
+                                        cursor = conn.cursor()
+                                        
+                                        # Get the most recent cache entry regardless of expiry
+                                        if blockchain_id:
+                                            cursor.execute(
+                                                "SELECT data, timestamp FROM protocol_cache WHERE url = ? AND blockchain_id = ? ORDER BY timestamp DESC LIMIT 1",
+                                                (api_url, blockchain_id)
+                                            )
+                                        else:
+                                            cursor.execute(
+                                                "SELECT data, timestamp FROM protocol_cache WHERE url = ? ORDER BY timestamp DESC LIMIT 1",
+                                                (api_url,)
+                                            )
+                                        
+                                        result = cursor.fetchone()
+                                        conn.close()
+                                        
+                                        if result:
+                                            data, timestamp = result
+                                            cache_age_hours = (time.time() - timestamp) / 3600
+                                            local_log(f"Using expired cache from {cache_age_hours:.1f} hours ago as last resort")
+                                            
+                                            # Create HTML from expired cached data
+                                            expired_data = json.loads(data)
+                                            html = "<html><body><h1>DeFi Llama Top Protocols (Expired Cache)</h1><table>"
+                                            html += "<tr><th>Name</th><th>TVL</th><th>Chain</th><th>Category</th></tr>"
+                                            
+                                            if isinstance(expired_data, list):
+                                                protocols = expired_data
+                                            elif isinstance(expired_data, dict) and 'protocols' in expired_data:
+                                                protocols = expired_data['protocols']
+                                            else:
+                                                protocols = []
+                                                
+                                            for protocol in protocols:
+                                                name = protocol.get('name', '')
+                                                tvl = protocol.get('tvl', 0)
+                                                chains = ", ".join(protocol.get('chains', [])) if isinstance(protocol.get('chains'), list) else protocol.get('chain', '')
+                                                category = protocol.get('category', '')
+                                                html += f"<tr><td>{name}</td><td>{tvl}</td><td>{chains}</td><td>{category}</td></tr>"
+                                            
+                                            html += "</table></body></html>"
+                                            return html
+                                        
+                                        raise Exception("All fetch attempts failed and no cache available")
                         
                         # Run the request in a thread pool
                         loop = asyncio.get_event_loop()
                         html_content = await loop.run_in_executor(None, fetch_html)
                         
                         local_log(f"Successfully fetched HTML content, length: {len(html_content)}")
+                        
+                        # Check if this is cached data by looking for the indicator in the HTML
+                        is_cached_data = "DeFi Llama Top Protocols (Cached)" in html_content or "DeFi Llama Top Protocols (Expired Cache)" in html_content
+                        
+                        if is_cached_data:
+                            local_log("Detected cached data in HTML - using direct extraction")
+                            investment_options = extract_from_cached_html(html_content)
+                            if investment_options:
+                                local_log(f"Successfully extracted {len(investment_options)} investment options from cached HTML")
+                                
+                                # Update job status to completed
+                                job.status = "completed"
+                                job.end_time = datetime.now().isoformat()
+                                job.result = {
+                                    "job_id": job_id,
+                                    "status": "completed",
+                                    "blockchain_id": blockchain_id,
+                                    "user_assets": [asset.dict() for asset in assets],
+                                    "investment_options": [option.dict() for option in investment_options],
+                                    "start_time": job.start_time,
+                                    "end_time": job.end_time
+                                }
+                                jobs[job_id] = job
+                                local_log(f"Job status updated to completed with {len(investment_options)} investment options")
+                                return investment_options
                     except Exception as e:
                         local_log(f"Error fetching HTML directly: {str(e)}")
                         html_content = None
